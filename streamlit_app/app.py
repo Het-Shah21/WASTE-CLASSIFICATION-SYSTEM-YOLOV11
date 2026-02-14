@@ -15,8 +15,8 @@ from PIL import Image
 import sqlite3
 import json
 import io
-import base64
 from datetime import datetime
+import traceback
 
 # ─── Page Config ──────────────────────────────────────────────────
 st.set_page_config(
@@ -34,15 +34,28 @@ HISTORY_DIR.mkdir(exist_ok=True)
 DB_PATH = HISTORY_DIR / "history.db"
 
 MODEL_VERSIONS = {
-    "YOLOv11": {"prefix": "waste_yolo11", "fallback": "yolo11n.pt", "color": "#9C27B0"},
-    "YOLOv8": {"prefix": "waste_yolov8", "fallback": "yolov8n.pt", "color": "#2196F3"},
-    "YOLOv5": {"prefix": "waste_yolov5", "fallback": "yolov5nu.pt", "color": "#4CAF50"},
+    "YOLOv11": {
+        "prefix": "waste_yolo11",
+        "fallback": "yolo11n.pt",
+        "color": "#9C27B0",
+        "emoji": "🟣",
+    },
+    "YOLOv8": {
+        "prefix": "waste_yolov8",
+        "fallback": "yolov8n.pt",
+        "color": "#2196F3",
+        "emoji": "🔵",
+    },
+    "YOLOv5": {
+        "prefix": "waste_yolov5",
+        "fallback": "yolov5nu.pt",
+        "color": "#4CAF50",
+        "emoji": "🟢",
+    },
 }
 
-CLASS_INFO = {
-    "organic": {"emoji": "🥬", "bg": "#d4edda", "label": "Organic"},
-    "recyclable": {"emoji": "♻️", "bg": "#cce5ff", "label": "Recyclable"},
-}
+# Waste class names (our custom model uses these)
+WASTE_CLASSES = {0: "Organic", 1: "Recyclable"}
 
 
 # ─── Database ─────────────────────────────────────────────────────
@@ -54,6 +67,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
             model_version TEXT NOT NULL,
+            model_type TEXT DEFAULT 'pretrained',
             image_name TEXT,
             image_thumbnail BLOB,
             num_detections INTEGER,
@@ -65,44 +79,53 @@ def init_db():
     conn.close()
 
 
-def save_prediction(model_version, image_name, image, detections, conf_threshold):
+def save_prediction(
+    model_version, model_type, image_name, image, detections, conf_threshold
+):
     """Save a prediction to the database."""
-    # Create thumbnail
-    thumb = image.copy()
-    thumb.thumbnail((200, 200))
-    buf = io.BytesIO()
-    thumb.save(buf, format="PNG")
-    thumb_bytes = buf.getvalue()
+    try:
+        thumb = image.copy()
+        thumb.thumbnail((200, 200))
+        buf = io.BytesIO()
+        thumb.save(buf, format="PNG")
+        thumb_bytes = buf.getvalue()
 
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute(
-        """INSERT INTO predictions
-           (timestamp, model_version, image_name, image_thumbnail,
-            num_detections, detections_json, confidence_threshold)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            datetime.now().isoformat(),
-            model_version,
-            image_name or "camera_capture",
-            thumb_bytes,
-            len(detections),
-            json.dumps(detections),
-            conf_threshold,
-        ),
-    )
-    conn.commit()
-    conn.close()
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            """INSERT INTO predictions
+               (timestamp, model_version, model_type, image_name, image_thumbnail,
+                num_detections, detections_json, confidence_threshold)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now().isoformat(),
+                model_version,
+                model_type,
+                image_name or "camera_capture",
+                thumb_bytes,
+                len(detections),
+                json.dumps(detections),
+                conf_threshold,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.toast(f"⚠️ History save failed: {e}", icon="⚠️")
 
 
 def load_history(limit=50):
     """Load recent prediction history."""
     conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
-        """SELECT id, timestamp, model_version, image_name, image_thumbnail,
-                  num_detections, detections_json, confidence_threshold
-           FROM predictions ORDER BY id DESC LIMIT ?""",
-        (limit,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """SELECT id, timestamp, model_version, image_name, image_thumbnail,
+                      num_detections, detections_json, confidence_threshold
+               FROM predictions ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Handle schema mismatch from earlier DB version
+        rows = []
     conn.close()
     return rows
 
@@ -117,28 +140,49 @@ def clear_history():
 
 # ─── Model Helpers ────────────────────────────────────────────────
 @st.cache_resource
-def load_model(model_path):
+def load_yolo_model(model_path_str):
     """Load a YOLO model (cached per path string)."""
     from ultralytics import YOLO
 
-    return YOLO(str(model_path))
+    return YOLO(model_path_str)
 
 
 def find_model_for_version(version):
-    """Find best trained model for a given YOLO version."""
+    """
+    Find best trained model for a given YOLO version.
+    Returns (model_path_str, is_custom_trained).
+    """
     info = MODEL_VERSIONS[version]
     if MODELS_DIR.exists():
         for model_dir in sorted(MODELS_DIR.glob(f"{info['prefix']}*"), reverse=True):
             best_pt = model_dir / "weights" / "best.pt"
             if best_pt.exists():
-                return best_pt, True
+                return str(best_pt), True
     return info["fallback"], False
 
 
-def classify_image(model, image, conf_threshold=0.25):
-    """Run inference on an image."""
-    results = model.predict(source=image, conf=conf_threshold, save=False, verbose=False)
+def run_inference(model, image, conf_threshold=0.25):
+    """Run inference on an image and return results."""
+    results = model.predict(
+        source=image, conf=conf_threshold, save=False, verbose=False
+    )
     return results[0]
+
+
+def format_class_name(cls_name, is_custom):
+    """
+    Map class names to waste categories.
+    Custom models: 'Organic' / 'Recyclable'
+    Pre-trained COCO models: Use the raw COCO class name
+    """
+    lower = cls_name.lower()
+    if "organic" in lower or lower in ("o",):
+        return "Organic", True
+    elif "recyclable" in lower or lower in ("r",):
+        return "Recyclable", False
+    else:
+        # Pre-trained COCO model — show raw class name
+        return cls_name, None
 
 
 # ─── UI ───────────────────────────────────────────────────────────
@@ -164,44 +208,72 @@ def main():
             index=0,
             help="Choose which YOLO version to use for detection",
         )
-        version_color = MODEL_VERSIONS[selected_version]["color"]
+        ver_info = MODEL_VERSIONS[selected_version]
         st.markdown(
-            f'<div style="padding:8px;background:{version_color}20;'
-            f'border-left:4px solid {version_color};border-radius:4px;">'
-            f"<strong>{selected_version}</strong> selected</div>",
+            f'<div style="padding:8px;background:{ver_info["color"]}20;'
+            f'border-left:4px solid {ver_info["color"]};border-radius:4px;">'
+            f'{ver_info["emoji"]} <strong>{selected_version}</strong> selected</div>',
             unsafe_allow_html=True,
         )
 
-        model_path, is_custom = find_model_for_version(selected_version)
-        badge = "Custom trained" if is_custom else "Pre-trained (COCO)"
-        model_name = Path(model_path).name if isinstance(model_path, Path) else model_path
-        st.info(f"📦 Model: `{model_name}` — {badge}")
+        model_path_str, is_custom = find_model_for_version(selected_version)
+        badge = "✅ Custom trained" if is_custom else "📦 Pre-trained (COCO)"
+        model_display = Path(model_path_str).name
+        st.info(f"Model: `{model_display}`\n\n{badge}")
+
+        if not is_custom:
+            st.warning(
+                f"⚠️ No custom-trained {selected_version} model found. "
+                "Using pre-trained COCO weights (80 classes). "
+                "Run the training notebook to train on waste data."
+            )
 
         # Confidence slider
         conf_threshold = st.slider(
-            "Confidence Threshold", min_value=0.1, max_value=1.0, value=0.25, step=0.05
+            "Confidence Threshold",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.25,
+            step=0.05,
         )
 
         st.markdown("---")
-        st.header("📋 Classes")
-        st.markdown("- 🥬 **Organic**: Food waste, plants, paper\n- ♻️ **Recyclable**: Plastic, metal, glass")
+        st.header("📋 Waste Classes")
+        st.markdown(
+            "- 🥬 **Organic**: Food waste, plants, paper\n"
+            "- ♻️ **Recyclable**: Plastic, metal, glass"
+        )
 
         st.markdown("---")
-        st.markdown(f"Made with ❤️ — {selected_version}")
+        st.caption(f"Made with ❤️ — {selected_version}")
 
     # ── Tabs ──────────────────────────────────────
     tab_detect, tab_history = st.tabs(["🎯 Detect", "📜 History"])
 
     # ───────────── DETECT TAB ─────────────────────
     with tab_detect:
-        with st.spinner("Loading model…"):
-            model = load_model(model_path)
+        # Load model
+        try:
+            with st.spinner(f"Loading {selected_version} model…"):
+                model = load_yolo_model(model_path_str)
+            st.success(f"{ver_info['emoji']} {selected_version} ready!", icon="✅")
+        except Exception as e:
+            st.error(
+                f"❌ Failed to load {selected_version}.\n\n"
+                f"**Error**: `{e}`\n\n"
+                "Make sure `ultralytics` is installed: `pip install ultralytics`"
+            )
+            return
 
         col1, col2 = st.columns(2)
 
         with col1:
             st.header("📤 Input")
-            input_method = st.radio("Choose input method:", ["Upload Image", "Camera"], horizontal=True)
+            input_method = st.radio(
+                "Choose input method:",
+                ["Upload Image", "Camera"],
+                horizontal=True,
+            )
 
             image = None
             image_name = None
@@ -209,57 +281,106 @@ def main():
             if input_method == "Upload Image":
                 uploaded_file = st.file_uploader(
                     "Upload an image",
-                    type=["jpg", "jpeg", "png", "bmp"],
+                    type=["jpg", "jpeg", "png", "bmp", "webp"],
                     help="Upload a waste image for classification",
                 )
                 if uploaded_file:
-                    image = Image.open(uploaded_file)
+                    image = Image.open(uploaded_file).convert("RGB")
                     image_name = uploaded_file.name
-                    st.image(image, caption="Uploaded Image", use_container_width=True)
+                    st.image(image, caption="Uploaded Image", width="stretch")
             else:
                 camera_image = st.camera_input("Take a photo")
                 if camera_image:
-                    image = Image.open(camera_image)
-                    image_name = f"camera_{datetime.now().strftime('%H%M%S')}.jpg"
+                    image = Image.open(camera_image).convert("RGB")
+                    image_name = (
+                        f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                    )
 
         with col2:
             st.header("🎯 Results")
 
             if image is not None:
-                with st.spinner("Classifying…"):
-                    results = classify_image(model, image, conf_threshold)
+                try:
+                    with st.spinner(f"Running {selected_version} inference…"):
+                        results = run_inference(model, image, conf_threshold)
 
-                result_img = results.plot()
-                st.image(result_img, caption=f"{selected_version} Detection", use_container_width=True)
+                    # Display annotated image
+                    result_img = results.plot()
+                    st.image(
+                        result_img,
+                        caption=f"{selected_version} Detection Result",
+                        width="stretch",
+                    )
 
-                boxes = results.boxes
-                detections_list = []
+                    # Process detections
+                    boxes = results.boxes
+                    detections_list = []
 
-                if len(boxes) > 0:
-                    st.success(f"✅ Found {len(boxes)} object(s) using **{selected_version}**")
-
-                    for box in boxes:
-                        cls_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        cls_name = results.names[cls_id]
-
-                        is_organic = "organic" in cls_name.lower()
-                        info = CLASS_INFO["organic"] if is_organic else CLASS_INFO["recyclable"]
-
-                        st.markdown(
-                            f'<div style="padding:10px;background-color:{info["bg"]};'
-                            f'border-radius:5px;margin:5px 0;">'
-                            f'<h3>{info["emoji"]} {cls_name}</h3>'
-                            f'<p>Confidence: <strong>{conf:.1%}</strong></p></div>',
-                            unsafe_allow_html=True,
+                    if len(boxes) > 0:
+                        st.success(
+                            f"✅ Found {len(boxes)} object(s) using "
+                            f"**{selected_version}**"
                         )
 
-                        detections_list.append({"class": cls_name, "confidence": round(conf, 4)})
-                else:
-                    st.warning("⚠️ No objects detected. Try adjusting the confidence threshold.")
+                        for box in boxes:
+                            cls_id = int(box.cls[0])
+                            conf = float(box.conf[0])
+                            raw_cls_name = results.names[cls_id]
 
-                # Save to history
-                save_prediction(selected_version, image_name, image, detections_list, conf_threshold)
+                            display_name, is_organic = format_class_name(
+                                raw_cls_name, is_custom
+                            )
+
+                            # Choose styling
+                            if is_organic is True:
+                                emoji, bg_color = "🥬", "#d4edda"
+                            elif is_organic is False:
+                                emoji, bg_color = "♻️", "#cce5ff"
+                            else:
+                                # COCO class (pre-trained, not waste)
+                                emoji, bg_color = "🔍", "#fff3cd"
+
+                            st.markdown(
+                                f'<div style="padding:10px;'
+                                f"background-color:{bg_color};"
+                                f'border-radius:8px;margin:5px 0;">'
+                                f"<h4>{emoji} {display_name}</h4>"
+                                f"<p>Confidence: <strong>{conf:.1%}</strong>"
+                                f" &nbsp;|&nbsp; Raw class: <code>{raw_cls_name}</code></p>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            detections_list.append(
+                                {
+                                    "class": display_name,
+                                    "raw_class": raw_cls_name,
+                                    "confidence": round(conf, 4),
+                                }
+                            )
+                    else:
+                        st.warning(
+                            "⚠️ No objects detected. Try:\n"
+                            "- Lowering the confidence threshold\n"
+                            "- Using a clearer image\n"
+                            "- Training a custom model for waste data"
+                        )
+
+                    # Save to history
+                    model_type = "custom" if is_custom else "pretrained"
+                    save_prediction(
+                        selected_version,
+                        model_type,
+                        image_name,
+                        image,
+                        detections_list,
+                        conf_threshold,
+                    )
+
+                except Exception as e:
+                    st.error(
+                        f"❌ Inference failed:\n\n```\n{traceback.format_exc()}\n```"
+                    )
             else:
                 st.info("👈 Upload an image or take a photo to get started!")
 
@@ -284,18 +405,25 @@ def main():
                 rid, ts, ver, name, thumb_bytes, n_det, det_json, conf_t = row
                 ts_short = ts[:19].replace("T", " ")
 
-                with st.expander(f"#{rid}  |  {ts_short}  |  **{ver}**  |  {name}  |  {n_det} detections"):
+                with st.expander(
+                    f"#{rid}  |  {ts_short}  |  **{ver}**  |  "
+                    f"{name}  |  {n_det} detection(s)"
+                ):
                     c1, c2 = st.columns([1, 2])
                     with c1:
                         if thumb_bytes:
                             st.image(thumb_bytes, caption="Thumbnail", width=180)
                     with c2:
                         st.markdown(f"**Model**: {ver}")
-                        st.markdown(f"**Confidence**: {conf_t}")
+                        st.markdown(f"**Confidence threshold**: {conf_t}")
                         dets = json.loads(det_json) if det_json else []
                         if dets:
                             for d in dets:
-                                st.markdown(f"- **{d['class']}**: {d['confidence']:.1%}")
+                                conf_val = d["confidence"]
+                                cls_display = d.get("class", d.get("raw_class", "?"))
+                                st.markdown(
+                                    f"- **{cls_display}**: {conf_val:.1%}"
+                                )
                         else:
                             st.caption("No detections")
 
@@ -303,7 +431,8 @@ def main():
     st.markdown("---")
     st.markdown(
         '<div style="text-align:center;color:gray;">'
-        "<p>🧠 Powered by YOLOv5 / YOLOv8 / YOLOv11 | Waste Classification Project</p>"
+        "<p>🧠 Powered by YOLOv5 / YOLOv8 / YOLOv11 "
+        "| Waste Classification Project</p>"
         "</div>",
         unsafe_allow_html=True,
     )

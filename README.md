@@ -160,7 +160,11 @@ See [Notebooks Guide](#-notebooks-guide) for details.
 ```python
 from ultralytics import YOLO
 
-model = YOLO('yolo11n.pt')
+# Choose your YOLO version:
+model = YOLO('yolo11n.pt')   # YOLOv11
+# model = YOLO('yolov8n.pt') # YOLOv8
+# model = YOLO('yolov5nu.pt') # YOLOv5
+
 model.train(data='data/processed/dataset.yaml', epochs=100)
 ```
 
@@ -198,7 +202,9 @@ YOLO-V11-PRO/
 │   ├── 07_yolo_architecture.ipynb
 │   ├── 08_loss_functions.ipynb
 │   ├── 09_yolov11_setup.ipynb
-│   └── 10_model_training.ipynb
+│   ├── 10_model_training.ipynb
+│   ├── 11_yolov8_training.ipynb   # YOLOv8
+│   └── 12_yolov5_training.ipynb   # YOLOv5
 │
 ├── 📁 src/
 │   └── math_from_scratch/         # NumPy implementations
@@ -216,18 +222,25 @@ YOLO-V11-PRO/
 │           └── last.pt
 │
 ├── 📁 streamlit_app/              # Deployment app
-│   ├── app.py
+│   ├── app.py                     # Multi-model selector + history
 │   ├── README.md
+│   ├── history/                   # SQLite prediction history
+│   │   └── history.db
 │   └── .streamlit/
 │       └── config.toml
 │
 ├── 📁 docs/                       # Documentation
-│   ├── CODE-THEORY.md             # Code ↔ Theory linkage
+│   ├── CODE-THEORY.md             # Code ↔ Theory (shared + v11)
+│   ├── CODE-THEORY-V8.md          # YOLOv8 architecture theory
+│   ├── CODE-THEORY-V5.md          # YOLOv5 architecture theory
+│   ├── COMPARISON_METRICS.md      # v5 vs v8 vs v11 comparison
 │   ├── SYSTEM_DESIGN.md           # Architecture design
-│   └── assets/                    # Images and diagrams
+│   └── assets/
 │
 ├── 📁 configs/                    # Training configs
-│   └── train_config.yaml
+│   ├── train_config.yaml          # YOLOv11
+│   ├── train_config_v8.yaml       # YOLOv8
+│   └── train_config_v5.yaml       # YOLOv5
 │
 ├── 📁 tests/                      # Unit tests
 ├── .gitignore
@@ -251,7 +264,9 @@ YOLO-V11-PRO/
 | 07 | `yolo_architecture.ipynb` | Theory | Backbone, Neck, Head architecture |
 | 08 | `loss_functions.ipynb` | Theory | BCE, Focal Loss, CIoU (NumPy) |
 | 09 | `yolov11_setup.ipynb` | Training | Ultralytics setup, configuration |
-| 10 | `model_training.ipynb` | Training | Full training pipeline |
+| 10 | `model_training.ipynb` | Training | YOLOv11 full training pipeline |
+| 11 | `yolov8_training.ipynb` | Training | YOLOv8 training pipeline |
+| 12 | `yolov5_training.ipynb` | Training | YOLOv5 training pipeline |
 
 ---
 
